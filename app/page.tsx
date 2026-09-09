@@ -1,123 +1,130 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-function bytesToBase64Url(bytes: Uint8Array) {
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary)
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
-}
-
-function base64UrlToBytes(value: string) {
-  const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
-  const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
-async function encodeText(text: string) {
-  const bytes = new TextEncoder().encode(text);
-
-  if (typeof CompressionStream !== 'undefined') {
-    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
-    const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
-    return `g.${bytesToBase64Url(compressed)}`;
-  }
-
-  return `r.${bytesToBase64Url(bytes)}`;
-}
-
-async function decodeText(value: string) {
-  const [mode, payload] = value.split('.', 2);
-  if (!payload) throw new Error('Invalid slate link');
-
-  const bytes = base64UrlToBytes(payload);
-
-  if (mode === 'g') {
-    if (typeof DecompressionStream === 'undefined') {
-      throw new Error('This browser cannot open compressed Slate links.');
-    }
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-    const restored = new Uint8Array(await new Response(stream).arrayBuffer());
-    return new TextDecoder().decode(restored);
-  }
-
-  if (mode === 'r') return new TextDecoder().decode(bytes);
-  throw new Error('Unknown slate format');
-}
+type Status = 'Loading' | 'Saved' | 'Unsaved' | 'Saving' | 'Offline' | 'Ready';
 
 export default function Home() {
   const [text, setText] = useState('');
-  const [status, setStatus] = useState('Ready');
-  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<Status>('Loading');
+  const [message, setMessage] = useState('Opening…');
+  const [busy, setBusy] = useState(true);
+  const [lastSaved, setLastSaved] = useState('');
+  const savedTextRef = useRef('');
 
-  useEffect(() => {
-    const hash = window.location.hash;
-    if (!hash.startsWith('#s=')) return;
-
-    setBusy(true);
-    decodeText(hash.slice(3))
-      .then((value) => {
-        setText(value);
-        setStatus('Opened from link');
-      })
-      .catch(() => setStatus('Could not open this link'))
-      .finally(() => setBusy(false));
-  }, []);
-
-  const details = useMemo(() => {
-    const lines = text ? text.split('\n').length : 0;
-    return `${text.length.toLocaleString()} chars · ${lines.toLocaleString()} lines`;
+  const stats = useMemo(() => {
+    const lines = text.length === 0 ? 0 : text.split('\n').length;
+    const chars = text.length;
+    const bytes = new TextEncoder().encode(text).byteLength;
+    const size = bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    return `${lines.toLocaleString()} lines · ${chars.toLocaleString()} chars · ${size}`;
   }, [text]);
 
-  async function makeLink(copy = true) {
-    if (!text.trim()) {
-      setStatus('Nothing to save');
-      return;
-    }
-
+  const load = useCallback(async () => {
     try {
       setBusy(true);
-      setStatus('Preparing link…');
-      const encoded = await encodeText(text);
-      const url = `${window.location.origin}${window.location.pathname}#s=${encoded}`;
-      window.history.replaceState(null, '', `#s=${encoded}`);
+      setStatus('Loading');
+      setMessage('Loading…');
 
-      if (copy) {
-        await navigator.clipboard.writeText(url);
-        setStatus('Link copied');
-      } else {
-        setStatus('Link updated');
+      const response = await fetch('/api/slate', {
+        method: 'GET',
+        cache: 'no-store',
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        if (data?.code === 'STORAGE_NOT_CONNECTED') {
+          throw new Error('Cloud storage is not connected yet.');
+        }
+        throw new Error(data?.error || 'Could not load Slate.');
       }
-    } catch {
-      setStatus('Could not copy link');
+
+      const value = typeof data.text === 'string' ? data.text : '';
+      setText(value);
+      savedTextRef.current = value;
+      setStatus(data.exists ? 'Saved' : 'Ready');
+      setMessage(data.exists ? 'Synced' : 'Ready');
+    } catch (error) {
+      setStatus('Offline');
+      setMessage(error instanceof Error ? error.message : 'Could not load Slate.');
     } finally {
       setBusy(false);
     }
-  }
+  }, []);
+
+  const save = useCallback(async () => {
+    try {
+      setBusy(true);
+      setStatus('Saving');
+      setMessage('Saving…');
+
+      const response = await fetch('/api/slate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+        },
+        body: text,
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        if (data?.code === 'STORAGE_NOT_CONNECTED') {
+          throw new Error('Cloud storage is not connected yet.');
+        }
+        throw new Error(data?.error || 'Could not save Slate.');
+      }
+
+      savedTextRef.current = text;
+      setStatus('Saved');
+      setMessage('Saved');
+      setLastSaved(
+        new Date(data.savedAt || Date.now()).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      );
+    } catch (error) {
+      setStatus('Offline');
+      setMessage(error instanceof Error ? error.message : 'Could not save Slate.');
+    } finally {
+      setBusy(false);
+    }
+  }, [text]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        if (!busy) void save();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [busy, save]);
 
   async function copyText() {
     try {
       await navigator.clipboard.writeText(text);
-      setStatus('Text copied');
+      setMessage('Copied');
     } catch {
-      setStatus('Could not copy text');
+      setMessage('Could not copy');
     }
   }
 
-  function clearSlate() {
+  function clearEditor() {
     setText('');
-    window.history.replaceState(null, '', window.location.pathname);
-    setStatus('Cleared');
+    setStatus('Unsaved');
+    setMessage('Unsaved');
   }
+
+  const isDirty = text !== savedTextRef.current;
 
   return (
     <main className="shell">
@@ -127,7 +134,10 @@ export default function Home() {
             <p className="eyebrow">SLATE</p>
             <h1>Untitled</h1>
           </div>
-          <div className="status" aria-live="polite">{busy ? 'Working…' : status}</div>
+          <div className={`status status-${status.toLowerCase()}`} aria-live="polite" title={message}>
+            <span className="status-dot" />
+            <span>{message}</span>
+          </div>
         </header>
 
         <textarea
@@ -136,31 +146,40 @@ export default function Home() {
           onChange={(event) => {
             setText(event.target.value);
             setStatus('Unsaved');
+            setMessage('Unsaved');
           }}
-          placeholder="Start typing…"
+          placeholder={busy && status === 'Loading' ? 'Loading…' : 'Start typing…'}
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
+          wrap="off"
           aria-label="Slate editor"
         />
 
         <footer className="toolbar">
-          <span className="details">{details}</span>
+          <div className="meta">
+            <span className="details">{stats}</span>
+            {lastSaved ? <span className="saved-time">Saved {lastSaved}</span> : null}
+          </div>
+
           <div className="actions">
-            <button className="ghost" type="button" onClick={clearSlate} disabled={busy || !text}>
+            <button className="ghost" type="button" onClick={() => void load()} disabled={busy}>
+              Reload
+            </button>
+            <button className="ghost" type="button" onClick={clearEditor} disabled={busy || !text}>
               Clear
             </button>
-            <button className="ghost" type="button" onClick={copyText} disabled={busy || !text}>
-              Copy text
+            <button className="ghost" type="button" onClick={() => void copyText()} disabled={busy || !text}>
+              Copy
             </button>
-            <button className="primary" type="button" onClick={() => makeLink(true)} disabled={busy || !text}>
-              Copy link
+            <button className="primary" type="button" onClick={() => void save()} disabled={busy || !isDirty}>
+              {status === 'Saving' ? 'Saving…' : 'Save'}
             </button>
           </div>
         </footer>
       </section>
 
-      <p className="hint">The note travels inside the link. Keep the link if you want to open it later.</p>
+      <p className="hint">Same Slate on every device. Ctrl/Cmd + S saves.</p>
     </main>
   );
 }
